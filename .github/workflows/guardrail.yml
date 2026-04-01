@@ -16,25 +16,22 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
 
-      - name: Install GuardRail
-        run: npm install -g guardrail-security
+      - name: Install dependencies and build GuardRail
+        run: npm ci && npm run build
 
-      - name: Run GuardRail scan before dependency install
-        run: guardrail scan --fail-fast --sarif guardrail.sarif
-
-      - name: Install dependencies without lifecycle scripts
-        run: npm ci --ignore-scripts
+      - name: Run GuardRail scan
+        run: node dist/src/index.js scan --fail-fast --sarif guardrail.sarif
 
       - name: Upload GuardRail SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: guardrail.sarif

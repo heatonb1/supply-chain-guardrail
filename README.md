@@ -7,7 +7,7 @@ The core insight: no existing tool catches "ghost dependencies" -- packages adde
 ## Quick Start
 
 ```bash
-npm install -g guardrail-security
+npm install -g supply-chain-guardrail
 cd your-project
 guardrail scan
 guardrail ioc list

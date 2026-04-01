@@ -1,13 +1,14 @@
 {
-  "name": "guardrail-security",
-  "version": "0.1.0",
+  "name": "supply-chain-guardrail",
+  "version": "1.0.0",
   "description": "npm supply chain security guardian — detects ghost dependencies, scores install script behavior, catches the axios blind spot, and blocks known malicious packages before they execute",
   "license": "MIT",
   "type": "commonjs",
   "main": "./dist/src/index.js",
   "bin": {
     "guardrail": "./dist/src/index.js",
-    "guardrail-security": "./dist/src/index.js"
+    "guardrail-security": "./dist/src/index.js",
+    "supply-chain-guardrail": "./dist/src/index.js"
   },
   "files": [
     "dist",

@@ -61,7 +61,39 @@ export async function runScan(
   const rootManifest = JSON.parse(rootManifestText) as Record<string, unknown>;
   const lockfile = parseLockfile(rootDir);
   const installedPackages = collectInstalledPackageSnapshots(rootDir, config);
-  const packageMap = mergeInstalledAndLockfilePackages(lockfile, installedPackages);
+  const packageMap = mergeInstalledAndLockfilePackages(lockfile, installedPackages, rootDir, config);
+
+  // Analyze the root project's own lifecycle scripts
+  const rootName = typeof rootManifest.name === 'string' ? rootManifest.name : 'root-project';
+  const rootVersion = typeof rootManifest.version === 'string' ? rootManifest.version : '0.0.0';
+  const rootLifecycleScripts = pickLifecycleScripts(normalizeScriptRecord(rootManifest.scripts));
+  if (Object.keys(rootLifecycleScripts).length > 0) {
+    const rootScriptFindings = analyzeLifecycleScripts(rootName, rootVersion, rootLifecycleScripts, (relativePath) =>
+      readLocalScriptFile(rootDir, relativePath, config.scan?.maxScriptFileBytes ?? 256000),
+    );
+    const rootKey = snapshotKey(rootName, rootVersion);
+    if (!packageMap[rootKey]) {
+      packageMap[rootKey] = {
+        name: rootName,
+        version: rootVersion,
+        packagePath: rootDir,
+        declaredDependencies: Object.keys(toRecord(rootManifest.dependencies)).sort(),
+        optionalDependencies: [],
+        peerDependencies: [],
+        importedDependencies: [],
+        unusedDeclaredDependencies: [],
+        lifecycleScripts: rootLifecycleScripts,
+        lifecycleScriptHashes: hashLifecycleScripts(rootLifecycleScripts),
+        scriptFindings: rootScriptFindings,
+        highestScriptRisk: highestScriptRisk(rootScriptFindings),
+        sourceFileCount: 0,
+        manifestHash: sha256(rootManifestText),
+        sourceHash: sha256('root'),
+        packageHash: sha256(rootManifestText),
+      };
+    }
+  }
+
   const lifecycleScriptsDiscovered = Object.values(packageMap).reduce(
     (count, entry) => count + Object.keys(entry.lifecycleScripts).length,
     0,
@@ -97,7 +129,7 @@ export async function runScan(
   const threshold = options.threshold ?? config.scan?.riskThreshold ?? 70;
   const issues = [
     ...compareSnapshots(previousSnapshot, currentSnapshot, trustedPackages, threshold),
-    ...detectProjectGhostDependencies(rootDir, packageMap, lockfile.packages, config),
+    ...detectProjectGhostDependencies(rootDir, rootManifest, packageMap, lockfile.packages, config),
     ...checkIocs(packageMap, config),
   ];
   issues.sort((left, right) => severityToNumber(right.severity) - severityToNumber(left.severity));
@@ -145,7 +177,11 @@ export async function runScan(
   }
 
   if (!options.quiet) {
-    printScanResult(result, threshold, options.updateBaseline === true);
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      printScanResult(result, threshold, options.updateBaseline === true);
+    }
   }
 
   const failSeverity = severityToNumber(config.scan?.failOnSeverity ?? 'high');
@@ -288,22 +324,48 @@ function compareSnapshots(
 function mergeInstalledAndLockfilePackages(
   lockfile: LockfileInfo,
   installedPackages: Record<string, PackageSnapshot>,
+  rootDir: string,
+  config: GuardrailConfig,
 ): Record<string, PackageSnapshot> {
   const merged: Record<string, PackageSnapshot> = { ...installedPackages };
 
   for (const node of lockfile.packages) {
     const key = snapshotKey(node.name, node.version);
     if (merged[key]) {
+      // Backfill hasInstallScripts from lockfile onto existing snapshots
+      if (node.hasInstallScripts && !merged[key]?.hasInstallScripts) {
+        (merged[key] as PackageSnapshot).hasInstallScripts = true;
+      }
       continue;
     }
-    merged[key] = buildMinimalSnapshotFromLockfile(node);
+    merged[key] = buildMinimalSnapshotFromLockfile(node, rootDir, config);
   }
 
   return merged;
 }
 
-function buildMinimalSnapshotFromLockfile(node: PackageNode): PackageSnapshot {
+function buildMinimalSnapshotFromLockfile(node: PackageNode, rootDir: string, config: GuardrailConfig): PackageSnapshot {
   const declaredDependencies = Object.keys(node.dependencies).sort();
+
+  // Try to read lifecycle scripts from the installed package in node_modules
+  let lifecycleScripts: Record<string, string> = {};
+  const possibleDir = node.path
+    ? path.join(rootDir, node.path)
+    : path.join(rootDir, 'node_modules', node.name);
+  const manifestPath = path.join(possibleDir, 'package.json');
+  try {
+    if (fs.existsSync(manifestPath)) {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      lifecycleScripts = pickLifecycleScripts(normalizeScriptRecord(manifest.scripts));
+    }
+  } catch { /* ignore read errors */ }
+
+  const scriptFindings = Object.keys(lifecycleScripts).length > 0
+    ? analyzeLifecycleScripts(node.name, node.version, lifecycleScripts, (relativePath) =>
+        readLocalScriptFile(possibleDir, relativePath, config.scan?.maxScriptFileBytes ?? 256000),
+      )
+    : [];
+
   return {
     name: node.name,
     version: node.version,
@@ -313,14 +375,15 @@ function buildMinimalSnapshotFromLockfile(node: PackageNode): PackageSnapshot {
     peerDependencies: [],
     importedDependencies: [],
     unusedDeclaredDependencies: [],
-    lifecycleScripts: {},
-    lifecycleScriptHashes: {},
-    scriptFindings: [],
-    highestScriptRisk: 0,
+    lifecycleScripts,
+    lifecycleScriptHashes: hashLifecycleScripts(lifecycleScripts),
+    scriptFindings,
+    highestScriptRisk: highestScriptRisk(scriptFindings),
     sourceFileCount: 0,
     manifestHash: sha256(JSON.stringify(node.dependencies)),
     sourceHash: sha256(`${node.name}@${node.version}`),
     packageHash: sha256(JSON.stringify(node)),
+    hasInstallScripts: node.hasInstallScripts,
   };
 }
 
@@ -619,6 +682,7 @@ function writeWorkflow(rootDir: string): void {
 
 function detectProjectGhostDependencies(
   rootDir: string,
+  rootManifest: Record<string, unknown>,
   packageMap: Record<string, PackageSnapshot>,
   lockfilePackages: PackageNode[],
   config: GuardrailConfig,
@@ -633,53 +697,83 @@ function detectProjectGhostDependencies(
     ...(config.scan?.trustedScriptPackages ?? []),
   ]);
 
-  // Build a set of packages with install scripts from both lockfile and installed snapshots
+  // Get all direct dependencies declared in the project's package.json
+  const declaredDeps = new Set<string>([
+    ...Object.keys(toRecord(rootManifest.dependencies)),
+    ...Object.keys(toRecord(rootManifest.devDependencies)),
+  ]);
+
+  // Build a set of packages that have install scripts (from lockfile flag, snapshot, or lockfile node)
   const packagesWithScripts = new Set<string>();
   for (const node of lockfilePackages) {
-    if (Object.keys(node.dependencies).length === 0) {
-      // Check installed snapshot for lifecycle scripts
-      const snap = Object.values(packageMap).find(s => s.name === node.name && s.version === node.version);
-      if (snap && Object.keys(snap.lifecycleScripts).length > 0) {
-        packagesWithScripts.add(snap.name);
-      }
+    if (node.hasInstallScripts) {
+      packagesWithScripts.add(node.name);
     }
   }
-  // Also check lockfile hasInstallScripts flag (lockfile v3)
   for (const snap of Object.values(packageMap)) {
-    if (Object.keys(snap.lifecycleScripts).length > 0) {
+    if (Object.keys(snap.lifecycleScripts).length > 0 || snap.hasInstallScripts) {
       packagesWithScripts.add(snap.name);
     }
   }
 
-  for (const packageName of packagesWithScripts) {
+  // Check every declared dependency — flag if never imported
+  for (const packageName of declaredDeps) {
     if (trustedScriptPackages.has(packageName)) continue;
     if (projectImports.has(packageName)) continue;
 
     const snap = Object.values(packageMap).find(s => s.name === packageName);
-    const scriptNames = snap ? Object.keys(snap.lifecycleScripts).join(', ') : 'install script';
+    const hasScripts = packagesWithScripts.has(packageName);
+    const scriptNames = snap && Object.keys(snap.lifecycleScripts).length > 0
+      ? Object.keys(snap.lifecycleScripts).join(', ')
+      : hasScripts ? 'install script (from lockfile)' : 'none';
     const scriptScore = snap?.highestScriptRisk ?? 0;
-    const severity: Severity = scriptScore >= 70 ? 'critical' : 'high';
 
-    issues.push({
-      id: `project:${packageName}:ghost-unimported`,
-      code: 'GR_GHOST_DEPENDENCY_UNIMPORTED',
-      category: 'ghost-dependency',
-      severity,
-      title: 'Package has install scripts but is never imported by project source',
-      description:
-        `${packageName} has lifecycle scripts (${scriptNames}) but no import, require, or re-export of this package was found anywhere in the project source tree. ` +
-        `This matches the ghost dependency pattern used in supply chain attacks like the axios/plain-crypto-js incident.`,
-      packageName,
-      packageVersion: snap?.version,
-      evidence: [
-        `lifecycle scripts: ${scriptNames}`,
-        `behavior score: ${String(scriptScore)}`,
-        `imported in project source: no`,
-      ],
-      recommendation:
-        'If this package was not intentionally added, treat the environment as compromised. ' +
-        'Add to scan.trustedScriptPackages in guardrail.config.json if this is a known-safe native module.',
-    });
+    if (hasScripts) {
+      // Has install scripts + never imported = HIGH or CRITICAL
+      const severity: Severity = scriptScore >= 70 ? 'critical' : 'high';
+      issues.push({
+        id: `project:${packageName}:ghost-unimported`,
+        code: 'GR_GHOST_DEPENDENCY_UNIMPORTED',
+        category: 'ghost-dependency',
+        severity,
+        title: 'Package has install scripts but is never imported by project source',
+        description:
+          `${packageName} has lifecycle scripts (${scriptNames}) but no import, require, or re-export of this package was found anywhere in the project source tree. ` +
+          `This matches the ghost dependency pattern used in supply chain attacks like the axios/plain-crypto-js incident.`,
+        packageName,
+        packageVersion: snap?.version,
+        evidence: [
+          `lifecycle scripts: ${scriptNames}`,
+          `behavior score: ${String(scriptScore)}`,
+          `imported in project source: no`,
+          `in package.json: yes (direct dependency)`,
+        ],
+        recommendation:
+          'If this package was not intentionally added, treat the environment as compromised. ' +
+          'Add to scan.trustedScriptPackages in guardrail.config.json if this is a known-safe native module.',
+      });
+    } else {
+      // No install scripts but still never imported = MEDIUM (unused dep)
+      issues.push({
+        id: `project:${packageName}:unused-dependency`,
+        code: 'GR_UNUSED_DEPENDENCY',
+        category: 'ghost-dependency',
+        severity: 'medium',
+        title: 'Declared dependency is never imported by project source',
+        description:
+          `${packageName} is listed in package.json but no import, require, or re-export was found in the project source tree. ` +
+          `While this package has no install scripts, unused dependencies increase attack surface.`,
+        packageName,
+        packageVersion: snap?.version,
+        evidence: [
+          `imported in project source: no`,
+          `in package.json: yes (direct dependency)`,
+          `has install scripts: no`,
+        ],
+        recommendation:
+          'Remove this dependency if it is not needed, or verify it is used via a mechanism GuardRail cannot detect (e.g., CLI tool, config reference).',
+      });
+    }
   }
 
   return issues;

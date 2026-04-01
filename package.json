@@ -45,12 +45,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/guardrail-security/guardrail.git"
+    "url": "https://github.com/heatonb1/guardrail-security.git"
   },
   "bugs": {
-    "url": "https://github.com/guardrail-security/guardrail/issues"
+    "url": "https://github.com/heatonb1/guardrail-security/issues"
   },
-  "homepage": "https://github.com/guardrail-security/guardrail#readme",
+  "homepage": "https://github.com/heatonb1/guardrail-security#readme",
   "devDependencies": {
     "@types/node": "^22.13.4",
     "typescript": "^5.8.3"

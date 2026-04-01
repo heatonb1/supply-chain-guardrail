@@ -159,6 +159,8 @@ export interface PackageNode {
   path?: string;
   dev?: boolean;
   optional?: boolean;
+  hasInstallScripts?: boolean;
+  scripts?: Record<string, string>;
 }
 
 export interface LockfileInfo {
@@ -197,6 +199,7 @@ export interface PackageSnapshot {
   manifestHash: string;
   sourceHash: string;
   packageHash: string;
+  hasInstallScripts?: boolean;
   registry?: Pick<RegistryPackageVersionMetadata, 'gitHead' | 'repository' | '_npmUser' | 'trustedPublisher'>;
 }
 
